@@ -1,30 +1,29 @@
+"""
+Pytest fixtures for the API test suite.
+
+Each test gets a completely fresh in-memory SQLite database (function-scoped
+engine + StaticPool so the single in-memory connection is shared within the
+test but discarded after it). This guarantees isolation — a user created in
+one test can't collide with the same fixture in the next.
+"""
+
 import pytest
-import asyncio
-from httpx import AsyncClient, ASGITransport
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from app.api.v1.users import create_access_token, get_password_hash
 from app.database import Base, get_db
-from app.models import User, Avatar, Session, Message, Conversation
-from app.api.v1.users import get_password_hash, create_access_token
+from app.models import User  # noqa: F401 — ensures models are registered on Base
 from main import app
 
-
-# Use in-memory SQLite for tests
-TEST_DATABASE_URL = "sqlite+aiosqlite:///./test.db"
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create a single event loop for the entire test session."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+# Pure in-memory DB — no file on disk, fully isolated per engine instance.
+TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 async def test_engine():
-    """Create a test database engine."""
+    """Fresh in-memory engine + schema for every test (full isolation)."""
     engine = create_async_engine(
         TEST_DATABASE_URL,
         connect_args={"check_same_thread": False},
@@ -33,14 +32,12 @@ async def test_engine():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield engine
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
     await engine.dispose()
 
 
 @pytest.fixture
 async def db_session(test_engine):
-    """Create a fresh database session for each test."""
+    """A session bound to the per-test engine."""
     session_factory = async_sessionmaker(
         test_engine,
         class_=AsyncSession,
@@ -48,12 +45,12 @@ async def db_session(test_engine):
     )
     async with session_factory() as session:
         yield session
-        await session.rollback()
 
 
 @pytest.fixture
 async def client(db_session):
-    """Create an async test client with overridden DB dependency."""
+    """Async test client with the DB dependency overridden to the test session."""
+
     async def override_get_db():
         yield db_session
 
@@ -66,7 +63,7 @@ async def client(db_session):
 
 @pytest.fixture
 async def test_user(db_session):
-    """Create a test user."""
+    """Create a test user in the per-test database."""
     user = User(
         email="test@example.com",
         username="testuser",
@@ -81,6 +78,6 @@ async def test_user(db_session):
 
 @pytest.fixture
 async def auth_headers(test_user):
-    """Get authorization headers for the test user."""
+    """Authorization headers for the test user."""
     token = create_access_token(data={"sub": test_user.id})
     return {"Authorization": f"Bearer {token}"}

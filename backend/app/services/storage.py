@@ -25,6 +25,7 @@ def _local_url(key: str) -> str:
 
 # ── Local storage ─────────────────────────────────────────────────────────────
 
+
 class LocalStorageService:
     """Store files on the local filesystem and serve them via /uploads/."""
 
@@ -61,11 +62,16 @@ class LocalStorageService:
     def get_url(self, key: str) -> str:
         return _local_url(key)
 
+    async def serving_url(self, key: str, ttl_seconds: int = 3600) -> str:
+        """URL the browser can actually fetch. Local files are public at /uploads/."""
+        return _local_url(key)
+
     async def cleanup(self):
         logger.info("Local storage cleanup complete")
 
 
 # ── S3 storage ────────────────────────────────────────────────────────────────
+
 
 class S3StorageService:
     """AWS S3 storage (used when USE_LOCAL_STORAGE=false)."""
@@ -92,6 +98,7 @@ class S3StorageService:
 
     async def initialize(self):
         from botocore.exceptions import ClientError
+
         try:
             async with self.session.client("s3") as s3:
                 try:
@@ -107,15 +114,37 @@ class S3StorageService:
             logger.error(f"Failed to initialise S3: {e}")
             raise
 
-    async def upload_file(self, file_data: bytes, key: str,
-                          content_type: str = "application/octet-stream",
-                          metadata: Optional[dict] = None) -> str:
+    async def upload_file(
+        self,
+        file_data: bytes,
+        key: str,
+        content_type: str = "application/octet-stream",
+        metadata: Optional[dict] = None,
+    ) -> str:
         async with self.session.client("s3") as s3:
-            extra: dict = {"ContentType": content_type, "ACL": "public-read"}
+            # Private by default — keeps avatar images, voice references, and
+            # generated session videos from being world-readable via guessable
+            # URLs. Callers that need a public-facing link should call
+            # `presigned_url(key, ttl_seconds=...)` and pass the result to
+            # the client. CloudFront with origin-access can serve these too.
+            extra: dict = {"ContentType": content_type, "ACL": "private"}
             if metadata:
                 extra["Metadata"] = metadata
             await s3.put_object(Bucket=self.bucket_name, Key=key, Body=file_data, **extra)
         return self.get_url(key)
+
+    async def presigned_url(self, key: str, ttl_seconds: int = 3600) -> str:
+        """
+        Generate a time-limited signed URL for an S3 object. Used by the
+        WebSocket pipeline when handing video chunk URLs to the client —
+        clients get a short-lived token instead of a permanent reference.
+        """
+        # boto3's generate_presigned_url is sync but cheap (no network call).
+        return self.s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.bucket_name, "Key": key},
+            ExpiresIn=ttl_seconds,
+        )
 
     async def download_file(self, key: str) -> bytes:
         async with self.session.client("s3") as s3:
@@ -135,11 +164,22 @@ class S3StorageService:
             return f"https://{self.cloudfront_domain}/{key}"
         return f"https://{self.bucket_name}.s3.{self.region}.amazonaws.com/{key}"
 
+    async def serving_url(self, key: str, ttl_seconds: int = 3600) -> str:
+        """
+        URL the browser can actually fetch. Objects are uploaded with
+        ACL=private, so the raw bucket URL 403s — return CloudFront (which
+        has origin access) when configured, else a time-limited presigned URL.
+        """
+        if self.cloudfront_domain:
+            return f"https://{self.cloudfront_domain}/{key}"
+        return await self.presigned_url(key, ttl_seconds)
+
     async def cleanup(self):
         logger.info("S3 storage cleanup complete")
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────
+
 
 def _build_storage_service():
     if getattr(settings, "USE_LOCAL_STORAGE", True):

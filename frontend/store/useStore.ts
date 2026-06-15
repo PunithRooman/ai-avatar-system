@@ -16,7 +16,7 @@ interface AppState {
   clearAuth: () => void
   isAuthenticated: () => boolean
 
-  // Theme
+  // Theme — UI is dark-first; toggle just for the few light-mode users
   theme: 'light' | 'dark'
   toggleTheme: () => void
 
@@ -38,11 +38,17 @@ export const useStore = create<AppState>()(
       token: null,
       user: null,
       setAuth: (token, user) => set({ token, user }),
-      clearAuth: () => set({ token: null, user: null, activeSessionId: null }),
+      clearAuth: () =>
+        set({
+          token: null,
+          user: null,
+          activeSessionId: null,
+          selectedAvatarId: null,
+        }),
       isAuthenticated: () => get().token !== null,
 
       // Theme
-      theme: 'light',
+      theme: 'dark',
       toggleTheme: () =>
         set((state) => ({
           theme: state.theme === 'light' ? 'dark' : 'light',
@@ -65,6 +71,7 @@ export const useStore = create<AppState>()(
         user: state.user,
         theme: state.theme,
         selectedAvatarId: state.selectedAvatarId,
+        activeSessionId: state.activeSessionId,
       }),
     }
   )

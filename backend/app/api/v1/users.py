@@ -1,46 +1,99 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from datetime import datetime, timedelta, timezone
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
+import bcrypt
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
 from app.database import get_db
 from app.models import User
-from app.schemas import UserCreate, UserUpdate, UserResponse, Token
-from app.config import settings
+from app.schemas import Token, UserCreate, UserResponse, UserUpdate
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/users/login", auto_error=False)
+
+# bcrypt only inspects the first 72 bytes of input and bcrypt>=4.1 raises
+# (rather than silently truncating) on longer input. We use the `bcrypt`
+# library directly because passlib 1.7.4 (last released 2020) is incompatible
+# with bcrypt 5.x — it can't read the version and mis-handles the backend.
+_BCRYPT_MAX_BYTES = 72
+
+
+def _truncate_password(password: str) -> bytes:
+    """Encode to UTF-8 and cap at bcrypt's 72-byte limit (boundary-safe)."""
+    encoded = password.encode("utf-8")
+    if len(encoded) <= _BCRYPT_MAX_BYTES:
+        return encoded
+    # Truncate without splitting a multi-byte character mid-sequence.
+    return encoded[:_BCRYPT_MAX_BYTES].decode("utf-8", "ignore").encode("utf-8")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    if not plain_password or not hashed_password:
+        return False
+    try:
+        return bcrypt.checkpw(_truncate_password(plain_password), hashed_password.encode("utf-8"))
+    except (ValueError, TypeError):
+        # Malformed hash (e.g. the empty-hash demo user) — treat as no match.
+        return False
 
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(_truncate_password(password), bcrypt.gensalt()).decode("utf-8")
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(hours=settings.JWT_EXPIRATION_HOURS))
+    expire = datetime.now(timezone.utc) + (
+        expires_delta or timedelta(hours=settings.JWT_EXPIRATION_HOURS)
+    )
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
+def _set_auth_cookie(response: Response, token: str) -> None:
+    """Store the JWT in an httpOnly cookie so JS can't read it (XSS-safe)."""
+    response.set_cookie(
+        key=settings.AUTH_COOKIE_NAME,
+        value=token,
+        max_age=settings.JWT_EXPIRATION_HOURS * 3600,
+        httponly=True,
+        secure=settings.AUTH_COOKIE_SECURE,
+        samesite=settings.AUTH_COOKIE_SAMESITE,
+        domain=settings.AUTH_COOKIE_DOMAIN,
+        path="/",
+    )
+
+
+def _clear_auth_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=settings.AUTH_COOKIE_NAME,
+        domain=settings.AUTH_COOKIE_DOMAIN,
+        path="/",
+    )
+
+
 async def get_current_user(
+    request: Request,
     token: Optional[str] = Depends(oauth2_scheme),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ) -> Optional[User]:
-    """Get current authenticated user, or None if no token"""
+    """
+    Resolve the current user from (in priority order):
+      1. the `Authorization: Bearer` header (API clients, cross-origin)
+      2. the httpOnly auth cookie (browser sessions — XSS-safe)
+    Returns None when neither yields a valid, known user.
+    """
+    if token is None:
+        token = request.cookies.get(settings.AUTH_COOKIE_NAME)
     if token is None:
         return None
     try:
@@ -66,34 +119,26 @@ async def require_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Inactive user"
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
     return user
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register_user(
-    user_data: UserCreate,
-    db: AsyncSession = Depends(get_db)
-):
+async def register_user(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     """Register a new user"""
     try:
         # Check if email already exists
         result = await db.execute(select(User).where(User.email == user_data.email))
         if result.scalar_one_or_none():
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Email already registered"
+                status_code=status.HTTP_409_CONFLICT, detail="Email already registered"
             )
 
         # Check if username already exists
         result = await db.execute(select(User).where(User.username == user_data.username))
         if result.scalar_one_or_none():
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Username already taken"
+                status_code=status.HTTP_409_CONFLICT, detail="Username already taken"
             )
 
         user = User(
@@ -115,22 +160,33 @@ async def register_user(
     except Exception as e:
         logger.error(f"Failed to register user: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to register user"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to register user"
         )
 
 
 @router.post("/login", response_model=Token)
 async def login(
+    response: Response,
     form_data: OAuth2PasswordRequestForm = Depends(),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """Login and get access token"""
+    """
+    Authenticate and issue a JWT. The token is BOTH returned in the body
+    (for API clients) AND set as an httpOnly cookie (for browser sessions —
+    not readable by JS, so XSS can't steal it).
+    """
     try:
         result = await db.execute(select(User).where(User.email == form_data.username))
         user = result.scalar_one_or_none()
 
-        if not user or not verify_password(form_data.password, user.hashed_password):
+        # Reject empty passwords explicitly — the demo user is seeded with an
+        # empty hash and would otherwise become a passwordless backdoor.
+        if (
+            not form_data.password
+            or not user
+            or not user.hashed_password
+            or not verify_password(form_data.password, user.hashed_password)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect email or password",
@@ -138,12 +194,10 @@ async def login(
             )
 
         if not user.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Inactive user"
-            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
 
         access_token = create_access_token(data={"sub": user.id})
+        _set_auth_cookie(response, access_token)
         return Token(access_token=access_token, token_type="bearer")
 
     except HTTPException:
@@ -151,15 +205,20 @@ async def login(
     except Exception as e:
         logger.error(f"Login failed: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Login failed"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Login failed"
         )
 
 
+@router.post("/logout")
+async def logout(response: Response):
+    """Clear the auth cookie. Stateless JWTs can't be server-revoked, so this
+    just removes the browser's cookie; bearer-token clients simply drop theirs."""
+    _clear_auth_cookie(response)
+    return {"detail": "Logged out"}
+
+
 @router.get("/me", response_model=UserResponse)
-async def get_current_user_profile(
-    user: User = Depends(require_current_user)
-):
+async def get_current_user_profile(user: User = Depends(require_current_user)):
     """Get current user profile"""
     return user
 
@@ -168,7 +227,7 @@ async def get_current_user_profile(
 async def update_current_user(
     update_data: UserUpdate,
     user: User = Depends(require_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """Update current user profile"""
     try:
@@ -178,8 +237,7 @@ async def update_current_user(
             )
             if result.scalar_one_or_none():
                 raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Email already registered"
+                    status_code=status.HTTP_409_CONFLICT, detail="Email already registered"
                 )
             user.email = update_data.email
 
@@ -189,8 +247,7 @@ async def update_current_user(
             )
             if result.scalar_one_or_none():
                 raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Username already taken"
+                    status_code=status.HTTP_409_CONFLICT, detail="Username already taken"
                 )
             user.username = update_data.username
 
@@ -211,8 +268,7 @@ async def update_current_user(
     except Exception as e:
         logger.error(f"Failed to update user: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update user"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update user"
         )
 
 
@@ -220,39 +276,38 @@ async def update_current_user(
 async def list_users(
     skip: int = 0,
     limit: int = 100,
-    db: AsyncSession = Depends(get_db)
+    current_user: User = Depends(require_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    """List all users"""
+    """List all users — superuser only"""
+    if not current_user.is_superuser:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
     try:
-        result = await db.execute(
-            select(User).offset(skip).limit(limit)
-        )
-        users = result.scalars().all()
-        return users
+        result = await db.execute(select(User).offset(skip).limit(min(limit, 200)))
+        return result.scalars().all()
 
     except Exception as e:
         logger.error(f"Failed to list users: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to list users"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to list users"
         )
 
 
 @router.get("/{user_id}", response_model=UserResponse)
 async def get_user(
     user_id: str,
-    db: AsyncSession = Depends(get_db)
+    current_user: User = Depends(require_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Get user by ID"""
+    """Get user by ID — own profile or superuser only"""
+    if str(current_user.id) != user_id and not current_user.is_superuser:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
     try:
         result = await db.execute(select(User).where(User.id == user_id))
         user = result.scalar_one_or_none()
 
         if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
         return user
 
@@ -261,6 +316,5 @@ async def get_user(
     except Exception as e:
         logger.error(f"Failed to get user: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to get user"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to get user"
         )

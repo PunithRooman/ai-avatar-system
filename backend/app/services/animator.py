@@ -1,7 +1,8 @@
 import asyncio
 import hashlib
+import json
 import logging
-import shutil
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -18,7 +19,10 @@ logger = logging.getLogger(__name__)
 
 class AvatarAnimator:
     """
-    Avatar Animation Service using SadTalker or simple ffmpeg fallback.
+    Avatar Animation Service.
+    Supported engines (set AVATAR_ENGINE in .env):
+      - musetalk : MuseTalk V1.5 — persistent worker (models loaded once)
+      - simple   : ffmpeg static image + audio, no lip-sync
     """
 
     def __init__(self):
@@ -26,11 +30,27 @@ class AvatarAnimator:
         self.resolution = settings.AVATAR_RESOLUTION
         self.fps = settings.AVATAR_FPS
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # None = not yet initialised; set to a truthy value after first init
+        self.use_float16 = self.device == "cuda"  # float16 on GPU = ~2× faster via Tensor Cores
         self._initialised = False
-        self._sadtalker_dir: Optional[Path] = None
+        self._musetalk_dir: Optional[Path] = None
 
-        logger.info(f"AvatarAnimator: engine={self.engine}, device={self.device}")
+        # Persistent worker handles
+        self._worker_proc: Optional[asyncio.subprocess.Process] = None
+        self._worker_lock = asyncio.Lock()
+        self._worker_env: dict = {}
+
+        if self.device == "cuda":
+            gpu_name = torch.cuda.get_device_name(0)
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            logger.info(
+                f"AvatarAnimator: engine={self.engine}, device=cuda "
+                f"({gpu_name}, {vram_gb:.1f} GB VRAM), float16={self.use_float16}"
+            )
+        else:
+            logger.info(
+                f"AvatarAnimator: engine={self.engine}, device=cpu "
+                f"(no GPU — consider AWS g5/g6 instance for real-time performance)"
+            )
 
     # ── initialisation ────────────────────────────────────────────────────────
 
@@ -38,35 +58,134 @@ class AvatarAnimator:
         if self._initialised:
             return
 
-        if self.engine == "sadtalker":
-            self._sadtalker_dir = self._find_sadtalker()
-            if self._sadtalker_dir is None:
+        if self.engine == "musetalk":
+            self._musetalk_dir = self._find_dir(settings.MUSETALK_PATH, "scripts/inference.py")
+            if self._musetalk_dir is None:
                 logger.warning(
-                    "SadTalker not found at '%s'. "
-                    "Run scripts/setup_sadtalker.sh to install it. "
-                    "Falling back to simple (static-image) animation.",
-                    settings.SADTALKER_PATH,
+                    "MuseTalk not found at '%s'. "
+                    "Run scripts/setup_musetalk.sh to install it. "
+                    "Falling back to simple animation.",
+                    settings.MUSETALK_PATH,
                 )
                 self.engine = "simple"
             else:
-                logger.info(f"SadTalker found at: {self._sadtalker_dir}")
-        elif self.engine == "liveportrait":
-            logger.warning("Live Portrait not yet implemented, using simple animation.")
+                logger.info(f"MuseTalk found at: {self._musetalk_dir}")
+                # Build env once
+                existing = os.environ.get("PYTHONPATH", "")
+                self._worker_env = os.environ.copy()
+                self._worker_env["PYTHONPATH"] = str(self._musetalk_dir) + (
+                    ":" + existing if existing else ""
+                )
+
+        elif self.engine not in ("simple",):
+            logger.warning(f"Unknown engine '{self.engine}', using simple animation.")
             self.engine = "simple"
 
         self._initialised = True
 
-    def _find_sadtalker(self) -> Optional[Path]:
-        """Return the SadTalker root dir if inference.py is present, else None."""
-        # Try configured path (resolved relative to backend/ working dir)
+    def _find_dir(self, config_path: str, marker_file: str) -> Optional[Path]:
         candidates = [
-            Path(settings.SADTALKER_PATH),
-            Path(__file__).resolve().parent.parent.parent / settings.SADTALKER_PATH,
+            Path(config_path),
+            Path(__file__).resolve().parent.parent.parent / config_path,
         ]
         for p in candidates:
-            if (p / "inference.py").exists():
+            if (p / marker_file).exists():
                 return p.resolve()
         return None
+
+    # ── persistent worker management ─────────────────────────────────────────
+
+    async def _ensure_worker(self) -> asyncio.subprocess.Process:
+        """Start the persistent worker if not already running."""
+        if self._worker_proc is not None and self._worker_proc.returncode is None:
+            return self._worker_proc
+
+        musetalk_dir: Path = self._musetalk_dir  # type: ignore[assignment]
+        worker_script = musetalk_dir / "scripts" / "musetalk_worker.py"
+
+        logger.info("Starting persistent MuseTalk worker (loading models once)…")
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(worker_script),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(musetalk_dir),
+            env=self._worker_env,
+        )
+
+        # Send init config — include float16 flag so worker can optimise for GPU
+        init_msg = (
+            json.dumps(
+                {
+                    "unet_model_path": str(musetalk_dir / "models" / "musetalkV15" / "unet.pth"),
+                    "unet_config": str(musetalk_dir / "models" / "musetalkV15" / "musetalk.json"),
+                    "whisper_dir": str(musetalk_dir / "models" / "whisper"),
+                    "vae_type": str(musetalk_dir / "models" / "sd-vae"),
+                    "use_float16": self.use_float16,
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.write(init_msg.encode())
+        await proc.stdin.drain()
+
+        # Wait for READY — GPU loads much faster (~60s) vs CPU (~5-10 min first time)
+        model_load_timeout = 120 if self.device == "cuda" else 600
+        logger.info(f"Waiting for worker to finish loading models (timeout={model_load_timeout}s)…")
+        try:
+            ready_line = await asyncio.wait_for(proc.stdout.readline(), timeout=model_load_timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("MuseTalk worker timed out while loading models")
+
+        if not ready_line.decode().strip().startswith("READY"):
+            stderr_out = await proc.stderr.read()
+            proc.kill()
+            raise RuntimeError(
+                f"Worker failed to start. stderr:\n{stderr_out.decode(errors='replace')}"
+            )
+
+        logger.info("MuseTalk worker ready — models loaded")
+        self._worker_proc = proc
+        return proc
+
+    async def _worker_infer(
+        self, image_path: str, audio_path: str, output_path: str, coord_cache: Optional[str]
+    ) -> str:
+        """Send one job to the persistent worker and await its result."""
+        async with self._worker_lock:
+            proc = await self._ensure_worker()
+
+            job = (
+                json.dumps(
+                    {
+                        "image": str(Path(image_path).resolve()),
+                        "audio": str(Path(audio_path).resolve()),
+                        "output": str(Path(output_path).resolve()),
+                        "coord_cache": coord_cache,
+                    }
+                )
+                + "\n"
+            )
+
+            proc.stdin.write(job.encode())
+            await proc.stdin.drain()
+
+            # GPU: expect ~5-15s per sentence; CPU: up to 5 min
+            infer_timeout = 60 if self.device == "cuda" else 300
+            try:
+                result_line = await asyncio.wait_for(proc.stdout.readline(), timeout=infer_timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                self._worker_proc = None
+                raise RuntimeError(f"MuseTalk inference timed out after {infer_timeout}s")
+
+            result = json.loads(result_line.decode().strip())
+            if result["status"] != "ok":
+                raise RuntimeError(result.get("msg", "Unknown worker error"))
+
+            return output_path
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -78,8 +197,8 @@ class AvatarAnimator:
         cache_key: Optional[str] = None,
     ) -> str:
         """
-        Animate avatar with audio.  Returns path to the generated video.
-        Falls back to simple (static image + audio) if SadTalker fails.
+        Animate avatar with audio. Returns path to the generated video.
+        Falls back to simple (static image + audio) on any engine failure.
         """
         if not self._initialised:
             await self.initialize()
@@ -88,63 +207,36 @@ class AvatarAnimator:
         logger.info(f"Animating [{self.engine}] image={avatar_image_path} audio={audio_path}")
 
         try:
-            if self.engine == "sadtalker":
-                return await self._animate_sadtalker(avatar_image_path, audio_path, output_path)
+            if self.engine == "musetalk":
+                return await self._animate_musetalk(avatar_image_path, audio_path, output_path)
             else:
                 return await self._animate_simple(avatar_image_path, audio_path, output_path)
         except Exception as e:
-            logger.error(f"Animation failed ({self.engine}): {e}. Retrying with simple fallback.")
+            logger.error(f"Animation failed ({self.engine}): {e}. Falling back to simple.")
             return await self._animate_simple(avatar_image_path, audio_path, output_path)
 
-    # ── engines ───────────────────────────────────────────────────────────────
+    # ── MuseTalk ──────────────────────────────────────────────────────────────
 
-    async def _animate_sadtalker(
+    async def _animate_musetalk(
         self,
         avatar_path: str,
         audio_path: str,
         output_path: str,
     ) -> str:
-        """Run SadTalker via subprocess and move its timestamped output to output_path."""
-        assert self._sadtalker_dir is not None, "SadTalker dir must be set before calling _animate_sadtalker"
-        result_dir = TMPDIR / f"sadtalker_{Path(output_path).stem}"
-        result_dir.mkdir(parents=True, exist_ok=True)
+        """Run MuseTalk via persistent worker (models stay loaded between calls)."""
+        musetalk_dir: Path = self._musetalk_dir  # type: ignore[assignment]
 
-        # SadTalker writes  result_dir/YYYY_MM_DD_HH.MM.SS.mp4
-        cmd = [
-            sys.executable,                          # same venv Python
-            str(self._sadtalker_dir / "inference.py"),
-            "--driven_audio", str(audio_path),
-            "--source_image", str(avatar_path),
-            "--result_dir", str(result_dir),
-            "--still",                               # reduce head movement
-            "--preprocess", "crop",                  # safe for portrait photos
-            "--size", "256",
-        ]
+        # Per-avatar face-coordinate cache (saves face-detection on repeat calls)
+        avatar_id = hashlib.md5(str(Path(avatar_path).resolve()).encode()).hexdigest()
+        coord_cache = str(musetalk_dir / "results" / "coords" / f"{avatar_id}.pkl")
+        os.makedirs(os.path.dirname(coord_cache), exist_ok=True)
 
-        logger.info("Running SadTalker: %s", " ".join(cmd))
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(self._sadtalker_dir),            # required — model paths are relative
-        )
-        stdout, stderr = await proc.communicate()
+        await self._worker_infer(avatar_path, audio_path, output_path, coord_cache)
 
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace")
-            logger.error(f"SadTalker stderr:\n{err}")
-            raise RuntimeError(f"SadTalker exited with code {proc.returncode}")
-
-        # Find the mp4 SadTalker produced
-        mp4_files = sorted(result_dir.glob("*.mp4"), key=lambda f: f.stat().st_mtime)
-        if not mp4_files:
-            raise FileNotFoundError(f"SadTalker produced no .mp4 in {result_dir}")
-
-        shutil.move(str(mp4_files[-1]), output_path)
-        shutil.rmtree(str(result_dir), ignore_errors=True)
-
-        logger.info(f"SadTalker animation done: {output_path}")
+        logger.info(f"MuseTalk animation done: {output_path}")
         return output_path
+
+    # ── Simple ffmpeg fallback ────────────────────────────────────────────────
 
     async def _animate_simple(
         self,
@@ -152,23 +244,36 @@ class AvatarAnimator:
         audio_path: str,
         output_path: str,
     ) -> str:
-        """
-        Fallback: combine static image + audio with FFmpeg.
-        No lip-sync — use only when SadTalker is unavailable.
-        """
+        """Combine static image + audio with FFmpeg. No lip-sync."""
         logger.info("Using simple animation (static image + audio, no lip-sync)")
 
         cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1", "-i", str(avatar_path),
-            "-i", str(audio_path),
-            "-c:v", "libx264",
-            "-tune", "stillimage",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-pix_fmt", "yuv420p",
+            "ffmpeg",
+            "-y",
+            "-loop",
+            "1",
+            "-i",
+            str(avatar_path),
+            "-i",
+            str(audio_path),
+            "-c:v",
+            "libx264",
+            "-tune",
+            "stillimage",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-pix_fmt",
+            "yuv420p",
             "-shortest",
-            "-vf", f"fps={self.fps},scale={self.resolution}:{self.resolution}:force_original_aspect_ratio=decrease,pad={self.resolution}:{self.resolution}:(ow-iw)/2:(oh-ih)/2",
+            "-vf",
+            (
+                f"fps={self.fps},"
+                f"scale={self.resolution}:{self.resolution}:"
+                f"force_original_aspect_ratio=decrease,"
+                f"pad={self.resolution}:{self.resolution}:(ow-iw)/2:(oh-ih)/2"
+            ),
             output_path,
         ]
 

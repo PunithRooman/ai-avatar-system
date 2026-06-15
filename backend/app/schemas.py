@@ -1,6 +1,7 @@
-from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, List, Dict, Any
 from datetime import datetime
+from typing import Any, Dict, Optional
+
+from pydantic import BaseModel, EmailStr, Field
 
 
 # User Schemas
@@ -34,16 +35,13 @@ class AvatarBase(BaseModel):
     name: str
 
 
-class AvatarCreate(AvatarBase):
-    pass
-
-
 class AvatarResponse(AvatarBase):
     id: str
     user_id: str
     image_url: str
     thumbnail_url: Optional[str] = None
     status: str
+    voice_id: Optional[str] = None
     avatar_metadata: Optional[Dict[str, Any]] = Field(None, alias="avatar_metadata")
     created_at: datetime
 
@@ -103,36 +101,24 @@ class ConversationResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-# WebSocket Schemas
-class WebSocketMessage(BaseModel):
-    type: str  # audio, text, video, ping, pong, error
-    data: Optional[Dict[str, Any]] = None
+class AvatarRename(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
 
 
-class AudioInput(BaseModel):
-    audio_data: str  # base64 encoded
-    format: str = "webm"
+class AvatarMetadataUpdate(BaseModel):
+    """Allowed editable metadata fields for an avatar.
 
+    Restrict to a known allowlist so users cannot stuff arbitrary keys into
+    the JSON column (which would otherwise let them shadow internal flags or
+    bloat the row).
+    """
 
-class TextInput(BaseModel):
-    text: str
+    system_prompt: Optional[str] = Field(default=None, max_length=8000)
+    personality: Optional[str] = Field(default=None, max_length=2000)
+    background_color: Optional[str] = Field(default=None, max_length=32)
+    animation_style: Optional[str] = Field(default=None, max_length=32)
 
-
-# Response Schemas
-class AvatarVideoResponse(BaseModel):
-    video_url: str
-    duration: float
-    status: str = "success"
-
-
-class ErrorResponse(BaseModel):
-    detail: str
-    error_code: Optional[str] = None
-
-
-class SuccessResponse(BaseModel):
-    message: str
-    data: Optional[Dict[str, Any]] = None
+    model_config = {"extra": "forbid"}
 
 
 # Token Schema
